@@ -4,7 +4,7 @@
 
 `sudo apt upgrade -y`
 
-`sudo snap install microk8s --clasic --chanel=1.28`
+`sudo snap install microk8s --classic --channel=1.28`
 
 `sudo usermod -a -G microk8s <USERNAME>`
 
