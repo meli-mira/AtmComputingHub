@@ -19,3 +19,5 @@
 `microk8s.enable gpu`
 
 `kubectl describe daemonset nvidia-device-plugin-daemonset -n kube-system`
+
+`kubectl label node <NODE_NAME> gpu-type=<GPU_TYPE>`
