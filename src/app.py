@@ -2,6 +2,8 @@ import gradio as gr
 import webbrowser
 from kubernetes import client, config
 
+ACH_HOST = '10.13.0.200'
+
 class KubeClient:
     def __init__(self):
         # Load in-cluster config
@@ -62,10 +64,39 @@ class KubeClient:
         
         return deployments_descriptions
 
+
+    def _create_pvc(self, pvc_name, storage_Gi):
+        pvc = client.V1PersistentVolumeClaim(
+            api_version="v1",
+            kind="PersistentVolumeClaim",
+            metadata=client.V1ObjectMeta(name=pvc_name),
+            spec=client.V1PersistentVolumeClaimSpec(
+                storage_class_name="ceph-rbd",
+                access_modes=["ReadWriteOnce"],
+                resources=client.V1ResourceRequirements(
+                    requests={"storage": f"{storage_Gi}Gi"}
+                )
+            )
+        )
+        response = self.core_client.create_namespaced_persistent_volume_claim(body=pvc, namespace="default")
+        return response
+
+    def _delete_pvc(self, pvc_name):
+        response = self.core_client.delete_namespaced_persistent_volume_claim(
+            name=pvc_name,
+            namespace="default"
+        )
+        return response
+
+    def _create_deployment(self):
+        pass
+    
     def create_workspace(self, deployment_name, cpu, mem, gpu_type, gpu_count):
         assert isinstance(deployment_name, str) and len(deployment_name) > 5
+        pvc_name = f"{deployment_name}-pvc"
         service_name = f"{deployment_name}-service"
         ingress_name = f"{deployment_name}-ingress"
+        self._create_pvc(pvc_name, storage_Gi=8)
         # Create a V1Deployment object
         deployment = client.V1Deployment(
             api_version="apps/v1",
@@ -79,6 +110,7 @@ class KubeClient:
                 template=client.V1PodTemplateSpec(
                     metadata=client.V1ObjectMeta(labels={"app": deployment_name}),
                     spec=client.V1PodSpec(
+                        security_context=client.V1PodSecurityContext(fs_group=100), #needed for the persistent folder "data"
                         containers=[
                             client.V1Container(
                                 name=deployment_name,
@@ -91,9 +123,23 @@ class KubeClient:
                                         "nvidia.com/gpu": gpu_count    # 2 GPUs
                                     }
                                 ),
+                                volume_mounts=[
+                                    client.V1VolumeMount(
+                                        name="data",
+                                        mount_path="/home/jovyan/data"
+                                    )
+                               ]
                             )
                         ],
-                        node_selector={"gpu-type": gpu_type}
+                        node_selector={"gpu-type": gpu_type},
+                        volumes=[
+                            client.V1Volume(
+                                name="data",
+                                persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                                    claim_name=pvc_name
+                                )
+                            )
+                       ]
                     )
                 )
             )
@@ -126,7 +172,7 @@ class KubeClient:
             spec=client.V1IngressSpec(
                 rules=[
                     client.V1IngressRule(
-                        host=f"{deployment_name}.10.13.0.100.nip.io",
+                        host=f"{deployment_name}.{ACH_HOST}.nip.io",
                         http=client.V1HTTPIngressRuleValue(
                             paths=[
                                 client.V1HTTPIngressPath(
@@ -155,6 +201,7 @@ class KubeClient:
 
     def delete_workspace(self, deployment_name):
         assert isinstance(deployment_name, str) and len(deployment_name) > 5
+        pvc_name = f"{deployment_name}-pvc"
         service_name = f"{deployment_name}-service"
         ingress_name = f"{deployment_name}-ingress"
     
@@ -178,6 +225,8 @@ class KubeClient:
                 grace_period_seconds=0  # Optional: Immediately delete the deployment
             )
         )
+
+        self._delete_pvc(pvc_name=pvc_name)
 
 
 
@@ -227,7 +276,7 @@ def refresh_ui():
         limits_gpu[i] = gr.update(value=deploy['gpu_limit'], visible=True)
         status_list[i] = gr.update(value=deploy['status'], visible=True)
         buttons_token[i] = gr.update(visible=True)
-        buttons_launch[i] = gr.update(visible=True, link=f"http://{deploy['name']}.10.13.0.100.nip.io")
+        buttons_launch[i] = gr.update(visible=True, link=f"http://{deploy['name']}.{ACH_HOST}.nip.io")
         buttons_start[i] = gr.update(visible=True)
         buttons_stop[i] = gr.update(visible=True)
         buttons_delete[i] = gr.update(visible=True)
@@ -243,7 +292,7 @@ def scaled_markdown(text='', scale=1, **kwargs):
     return md
 
 with gr.Blocks() as demo:
-    gr.Markdown("# ATM Computing Hub")
+    gr.Markdown("# ATM Computing Hub `beta`")
 
     workspaces = []
     workspaces_buttons_start = []
