@@ -39,13 +39,16 @@ class KubeClient:
             labels = deploy.spec.selector.match_labels
             label_selector = ",".join([f"{k}={v}" for k, v in labels.items()])
             pods = self.core_client.list_namespaced_pod(namespace='default', label_selector=label_selector)
-            state = pods.items[0].status.container_statuses[0].state
-            if state.waiting:
-                status = 'Waiting'
-            elif state.running:
-                status = 'Running'
-            elif state.terminated:
-                status = 'Terminated'
+            if len(pods.items) == 0:
+                status = 'Stopped' # Replica set is ZERO
+            else:
+                state = pods.items[0].status.container_statuses[0].state
+                if state.waiting:
+                    status = 'Waiting'
+                elif state.running:
+                    status = 'Running'
+                elif state.terminated:
+                    status = 'Terminated'
         except Exception as exception:
             print(f'Failed to get pod status: {exception}')
         
@@ -88,16 +91,7 @@ class KubeClient:
         )
         return response
 
-    def _create_deployment(self):
-        pass
-    
-    def create_workspace(self, deployment_name, cpu, mem, gpu_type, gpu_count):
-        assert isinstance(deployment_name, str) and len(deployment_name) > 5
-        pvc_name = f"{deployment_name}-pvc"
-        service_name = f"{deployment_name}-service"
-        ingress_name = f"{deployment_name}-ingress"
-        self._create_pvc(pvc_name, storage_Gi=8)
-        # Create a V1Deployment object
+    def _create_deployment(self, deployment_name, pvc_name, cpu, mem, gpu_count, gpu_type):
         deployment = client.V1Deployment(
             api_version="apps/v1",
             kind="Deployment",
@@ -146,7 +140,34 @@ class KubeClient:
         )
         
         response = self.apps_client.create_namespaced_deployment(body=deployment, namespace="default")
+        return response
 
+    def _scale_deployment(self, deployment_name, replicas):
+        response = self.apps_client.patch_namespaced_deployment(
+            name=deployment_name,
+            namespace="default",
+            body={"spec": {"replicas": replicas}}
+        )
+        return response
+
+    def _start_deployment(self, deployment_name):
+        return self._scale_deployment(deployment_name, replicas=1)
+
+    def _stop_deployment(self, deployment_name):
+        return self._scale_deployment(deployment_name, replicas=0)
+    
+    def _delete_deployment(self, deployment_name):
+        response = self.apps_client.delete_namespaced_deployment(
+            name=deployment_name,
+            namespace="default",
+            body=client.V1DeleteOptions(
+                propagation_policy='Foreground',  # Ensures that all associated resources are deleted
+                grace_period_seconds=0  # Optional: Immediately delete the deployment
+            )
+        )
+        return response
+
+    def _create_service(self, service_name, deployment_name):
         service = client.V1Service(
             api_version="v1",
             kind="Service",
@@ -164,7 +185,16 @@ class KubeClient:
     
         # Create the service in the specified namespace
         response = self.core_client.create_namespaced_service(namespace="default", body=service)
-        
+        return response
+
+    def _delete_service(self, service_name):
+        response = self.core_client.delete_namespaced_service(
+            name=service_name,
+            namespace="default"
+        )
+        return response
+
+    def _create_ingress(self, ingress_name, deployment_name, service_name):
         ingress = client.V1Ingress(
             api_version="networking.k8s.io/v1",
             kind="Ingress",
@@ -199,34 +229,36 @@ class KubeClient:
         )
         return response
 
-    def delete_workspace(self, deployment_name):
-        assert isinstance(deployment_name, str) and len(deployment_name) > 5
-        pvc_name = f"{deployment_name}-pvc"
-        service_name = f"{deployment_name}-service"
-        ingress_name = f"{deployment_name}-ingress"
-    
-        # Delete the Ingress
-        self.net_client.delete_namespaced_ingress(
+    def _delete_ingress(self, ingress_name):
+        response = self.net_client.delete_namespaced_ingress(
             name=ingress_name,
             namespace="default"
         )
-
-        # Delete the Service
-        self.core_client.delete_namespaced_service(
-            name=service_name,
-            namespace="default"
-        )
-
-        self.apps_client.delete_namespaced_deployment(
-            name=deployment_name,
-            namespace="default",
-            body=client.V1DeleteOptions(
-                propagation_policy='Foreground',  # Ensures that all associated resources are deleted
-                grace_period_seconds=0  # Optional: Immediately delete the deployment
-            )
-        )
-
-        self._delete_pvc(pvc_name=pvc_name)
+        return response
+    
+    def start_workspace(self, deployment_name):
+        self._start_deployment(deployment_name)
+        
+    def stop_workspace(self, deployment_name):
+        self._stop_deployment(deployment_name)
+    
+    def create_workspace(self, deployment_name, cpu, mem, storage, gpu_type, gpu_count):
+        pvc_name = f"{deployment_name}-pvc"
+        service_name = f"{deployment_name}-service"
+        ingress_name = f"{deployment_name}-ingress"
+        self._create_pvc(pvc_name, storage_Gi=storage)
+        self._create_deployment(deployment_name, pvc_name, cpu, mem, gpu_count, gpu_type)
+        self._create_service(service_name, deployment_name)
+        self._create_ingress(ingress_name, deployment_name, service_name)
+    
+    def delete_workspace(self, deployment_name):
+        pvc_name = f"{deployment_name}-pvc"
+        service_name = f"{deployment_name}-service"
+        ingress_name = f"{deployment_name}-ingress"
+        self._delete_ingress(ingress_name)
+        self._delete_service(service_name)
+        self._delete_deployment(deployment_name)
+        self._delete_pvc(pvc_name)
 
 
 
@@ -235,18 +267,29 @@ kubeClient = KubeClient()
 
 UI_WORKSPACE_SLOTS = 50
 
-def create_workspace(cpu, mem, gpu_type, gpu_count, email):
+def create_workspace(cpu, mem, storage, gpu_type, gpu_count, email):
     if not email:
         return "Error: The email field is required."
     email = email.split("@")[0]
     name = email.replace('.', '-')
-    kubeClient.create_workspace(f"workspace-{name}", cpu, mem, gpu_type.lower(), gpu_count)
+    assert isinstance(name, str) and len(name) > 5
+    kubeClient.create_workspace(f"workspace-{name}", cpu, mem, storage, gpu_type.lower(), gpu_count)
     return "Workspace created. Wait 5 minutes and refresh."
 
 def delete_workspace(workspace_name):
     print(workspace_name)
     kubeClient.delete_workspace(workspace_name)
     return "Workspace deleted. Wait 5 minutes and refresh."
+
+def start_workspace(workspace_name):
+    print(workspace_name)
+    kubeClient.start_workspace(workspace_name)
+    return "Workspace started. Wait 5 minutes and refresh."
+
+def stop_workspace(workspace_name):
+    print(workspace_name)
+    kubeClient.stop_workspace(workspace_name)
+    return "Workspace stopped. Wait 5 minutes and refresh."
 
 def get_connection_token(workspace_name):
     logs = kubeClient.get_deployment_logs(workspace_name)
@@ -274,12 +317,16 @@ def refresh_ui():
         limits_cpu[i] = gr.update(value=deploy['cpu_limit'], visible=True)
         limits_mem[i] = gr.update(value=deploy['memory_limit'], visible=True)
         limits_gpu[i] = gr.update(value=deploy['gpu_limit'], visible=True)
+        status = deploy['status']
         status_list[i] = gr.update(value=deploy['status'], visible=True)
-        buttons_token[i] = gr.update(visible=True)
-        buttons_launch[i] = gr.update(visible=True, link=f"http://{deploy['name']}.{ACH_HOST}.nip.io")
-        buttons_start[i] = gr.update(visible=True)
-        buttons_stop[i] = gr.update(visible=True)
-        buttons_delete[i] = gr.update(visible=True)
+        buttons_token[i] = gr.update(visible=True if status == 'Running' else False)
+        buttons_launch[i] = gr.update(
+            visible=True if status == 'Running' else False, 
+            link=f"http://{deploy['name']}.{ACH_HOST}.nip.io"
+        )
+        buttons_start[i] = gr.update(visible=True if status == 'Stopped' else False)
+        buttons_stop[i] = gr.update(visible=True if status == 'Running' else False)
+        buttons_delete[i] = gr.update(visible=True if status in ['Running', 'Stopped'] else False)
         
     status = f"The cluster is running {len(deployments)} workspaces."
     return workspaces + limits_cpu + limits_mem + \
@@ -291,7 +338,7 @@ def scaled_markdown(text='', scale=1, **kwargs):
         md = gr.Markdown(text, **kwargs)
     return md
 
-with gr.Blocks() as demo:
+with gr.Blocks(title="ATM Computing Hub") as demo:
     gr.Markdown("# ATM Computing Hub `beta`")
 
     workspaces = []
@@ -307,15 +354,16 @@ with gr.Blocks() as demo:
 
     with gr.Row():
         server_status = gr.Textbox(label="Kube status")
-        refresh_button = gr.Button("Refresh")
+        refresh_button = gr.Button("Refresh", elem_classes=["button-auto-width"])
 
     with gr.Accordion("Create new workspace", open=False):
         with gr.Row():
             create_panel_cpu_count = gr.Number(label="Num CPUs:", value=12, interactive=True, minimum=1, maximum=32)
             create_panel_mem_count = gr.Number(label="Memory (GB):", value=24, interactive=True, minimum=1, maximum=64)
-            create_panel_gpu_type = gr.Dropdown(label="GPU Type", choices=['K40', 'K80'], value='K80', interactive=True)
+            create_panel_storage_count = gr.Number(label="Storage (GB):", value=200, interactive=True, minimum=1, maximum=1000)
+            create_panel_gpu_type = gr.Dropdown(label="GPU Type", choices=['K80'], value='K80', interactive=True)
             create_panel_gpu_count = gr.Number(label="Num GPUs:", value=2, interactive=True, minimum=0, maximum=4)
-            create_panel_email = gr.Textbox(label="Email (@mta):", value='')
+            create_panel_email = gr.Textbox(label="Email (@mta):", value='', type='email')
         create_button = gr.Button("Create Workspace")
         # create_panel_status = gr.Markdown("x")
     
@@ -337,17 +385,23 @@ with gr.Blocks() as demo:
                 workspaces_limits_gpu.append(scaled_markdown(visible=False)) # GPU
                 workspaces_status.append(scaled_markdown(visible=False))
 
-                with gr.Column(scale=4, min_width='5%'):
+                with gr.Column(scale=10):
                     with gr.Row():
-                        token_button = gr.Button("Token", visible=False, size='sm')
+                        token_button = gr.Button("Token🔑", visible=False, size='sm', min_width=0)
                         workspaces_buttons_token.append(token_button)
                         token_button.click(get_connection_token, inputs=workspace_name, outputs=server_status)
                         
-                        workspaces_buttons_launch.append(gr.Button("Launch🚀", visible=False, size='sm'))
-                        workspaces_buttons_start.append(gr.Button("Start", visible=False, size='sm'))
-                        workspaces_buttons_stop.append(gr.Button("Stop", visible=False, size='sm'))
-        
-                        delete_button = gr.Button("Delete", visible=False, size='sm')
+                        workspaces_buttons_launch.append(gr.Button("Launch🚀", visible=False, size='sm', min_width=0))
+                        
+                        start_button = gr.Button("Start🟢", visible=False, size='sm', min_width=0)
+                        workspaces_buttons_start.append(start_button)
+                        start_button.click(start_workspace, inputs=workspace_name, outputs=server_status)
+
+                        stop_button = gr.Button("Stop🔴", visible=False, size='sm', min_width=0)
+                        workspaces_buttons_stop.append(stop_button)
+                        stop_button.click(stop_workspace, inputs=workspace_name, outputs=server_status)
+            
+                        delete_button = gr.Button("Delete", visible=False, size='sm', variant='stop', min_width=0)
                         workspaces_buttons_delete.append(delete_button)
                         delete_button.click(delete_workspace, inputs=workspace_name, outputs=server_status)
     
@@ -359,7 +413,8 @@ with gr.Blocks() as demo:
     create_button.click(
         create_workspace, 
         inputs=[create_panel_cpu_count, 
-                create_panel_mem_count, 
+                create_panel_mem_count,
+                create_panel_storage_count,
                 create_panel_gpu_type, 
                 create_panel_gpu_count, 
                 create_panel_email], 
